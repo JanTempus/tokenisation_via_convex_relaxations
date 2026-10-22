@@ -1,0 +1,501 @@
+from lp_tokenizer.lp_tokenizer import BYTE_LEVEL_ALPHABET, Tokenizer
+from lp_tokenizer.celex import default_celex_dir, validate_pently_rho
+from transformers import AutoTokenizer
+from datasets import Value, concatenate_datasets, load_dataset, load_from_disk
+from tokenizers import Regex
+from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split
+from lp_tokenizer.lp_functions import solve_vocab_on_model
+from lp_tokenizer.document_tokenizer import TrainingOptions, mode_directory
+from tokenizers import Tokenizer as BackendTokenizer
+from tokenizers.models import BPE
+from types import SimpleNamespace
+import pickle
+import json
+import os
+from pathlib import Path
+import traceback
+
+
+PRETOKENIZER_MODE = os.environ.get("PRETOKENIZER_MODE", "nanochat").strip().lower()
+_APERTUS_SPLIT_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+"
+    r"|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*"
+    r"|\p{N}"
+    r"| ?[^\s\p{L}\p{N}]+[\r\n/]*"
+    r"|\s*[\r\n]+"
+    r"|\s+(?!\S)"
+    r"|\s+"
+)
+_NANOCHAT_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+SOURCE_TEXT_COLUMN = {
+    "finemath": "text",
+    "fineweb": "text",
+    "fineweb2": "text",
+    "infimath": "text",
+    "megamath": "text",
+    "starcoder": "content",
+}
+
+
+def build_pretokenizer(mode):
+    if mode == "pythia":
+        return AutoTokenizer.from_pretrained(
+            "EleutherAI/pythia-70m-deduped", revision="step3000",
+        )
+
+    # These modes need only a local pretokenizer, not Pythia's model files.
+    tokenizer = SimpleNamespace(backend_tokenizer=BackendTokenizer(BPE()))
+
+    if mode == "split_bytelevel":
+        tokenizer.backend_tokenizer.pre_tokenizer = Sequence(
+            [ByteLevel(add_prefix_space=False, trim_offsets=True, use_regex=True)]
+        )
+        return tokenizer
+
+    patterns = {
+        "apertus": _APERTUS_SPLIT_PATTERN,
+        "nanochat": _NANOCHAT_SPLIT_PATTERN,
+    }
+
+    if mode in patterns:
+        tokenizer.backend_tokenizer.pre_tokenizer = Sequence(
+            [
+                Split(
+                    pattern=Regex(patterns[mode]),
+                    behavior="isolated",
+                    invert=False,
+                ),
+                ByteLevel(
+                    add_prefix_space=False,
+                    trim_offsets=True,
+                    use_regex=False,
+                ),
+            ]
+        )
+        return tokenizer
+
+    raise ValueError(
+        f"Unsupported PRETOKENIZER_MODE='{mode}'. "
+        f"Expected one of: pythia, split_bytelevel, apertus, nanochat"
+    )
+
+
+pretokenizer = build_pretokenizer(PRETOKENIZER_MODE)
+
+
+def train_lp_tokenizer(dataset, unique_chars, vocab_size, save_dir, pretokenizer_obj,
+                       special_tokens, pently_rho=0.0, celex_dir=None,
+                       vocab_utilisation_weight=0.0, training_mode="standard",
+                       max_token_bytes=None, super_base_vocab_size=None,
+                       compression_divisor=None):
+    options = TrainingOptions(training_mode, max_token_bytes, super_base_vocab_size)
+    options.validate_penalties(pently_rho, vocab_utilisation_weight)
+    if training_mode != "standard":
+        save_dir = str(mode_directory(save_dir, training_mode))
+    tokenizer = Tokenizer(
+        corpus=dataset,
+        vocab_size=vocab_size,
+        special_tokens=special_tokens,
+        unique_chars=unique_chars,
+        pretokenizer=pretokenizer_obj,
+        training_mode=training_mode, max_token_bytes=max_token_bytes,
+        super_base_vocab_size=super_base_vocab_size,
+    )
+    unmatched_report_path = (
+        os.path.join(save_dir, "celex_unmatched.tsv")
+        if pently_rho > 0.0
+        else None
+    )
+    tokens = tokenizer.make_vocab_cuopt(
+        pently_rho=pently_rho,
+        vocab_utilisation_weight=vocab_utilisation_weight,
+        compression_divisor=compression_divisor,
+        celex_dir=celex_dir,
+        unmatched_report_path=unmatched_report_path,
+    )
+    file_name = os.path.join(save_dir, f"lp_tokens_{vocab_size}.pkl")
+    os.makedirs(save_dir, exist_ok=True)
+    with open(file_name, "wb") as f:
+        pickle.dump(tokens, f)
+
+
+def print_lp_variable_counts(vocab_size, x_values, cuopt_model):
+    num_f = int(cuopt_model["num_f"])
+    num_g = int(cuopt_model["num_g"])
+    num_t = int(cuopt_model["num_t"])
+    expected_total = num_f + num_g + num_t
+
+    if len(x_values) != expected_total:
+        print(
+            f"[lp-variable-counts] WARNING: vocab_size={vocab_size} "
+            f"has {len(x_values)} x_values but expected {expected_total} "
+            f"(num_f={num_f}, num_g={num_g}, num_t={num_t})"
+        )
+
+    f_values = x_values[:num_f]
+    g_values = x_values[num_f:num_f + num_g]
+    t_values = x_values[num_f + num_g:num_f + num_g + num_t]
+
+    print(f"[lp-variable-counts] vocab_size={vocab_size}")
+    for name, values in (
+        ("f", f_values),
+        ("g", g_values),
+        ("t", t_values),
+        ("all", x_values),
+    ):
+        print(
+            f"[lp-variable-counts] {name}: total={len(values)} "
+            f">0.999={int((values > 0.999).sum())} "
+            f">0.001={int((values > 0.001).sum())}"
+        )
+
+
+def _solve_and_save_lp_vocab(
+    cuopt_model,
+    unique_chars,
+    special_tokens,
+    vocab_size,
+    save_dir,
+):
+    print("---------------------------------------", flush=True)
+    print(f"[sweep] Solving for vocab_size={vocab_size}", flush=True)
+    print("---------------------------------------", flush=True)
+    if cuopt_model.get("document_training"):
+        from lp_tokenizer.document_training import solve_document_vocab
+        tokens = solve_document_vocab(cuopt_model, vocab_size, solve_vocab_on_model)
+        tokens.pop("x_values", None)
+        file_name = os.path.join(save_dir, f"lp_tokens_{vocab_size}.pkl")
+        with open(file_name, "wb") as f:
+            pickle.dump(tokens, f)
+        print(f"[sweep] Saved document vocabulary to {file_name}", flush=True)
+        return
+    lp_budget = vocab_size - len(unique_chars) - len(special_tokens)
+    if lp_budget <= 0:
+        raise ValueError(
+            f"Vocab size {vocab_size} too small: unique_chars={len(unique_chars)} "
+            f"+ special_tokens={len(special_tokens)} already exceeds budget."
+        )
+    print(
+        f"[solve_for_vocab_size] vocab_size={vocab_size} lp_budget={lp_budget}",
+        flush=True,
+    )
+    result = solve_vocab_on_model(
+        cuopt_model, numAllowedTokens=lp_budget, vocab_size=vocab_size,
+    )
+    tokens = {
+        "possible_tokens": result["possible_tokens"],
+        "unique_chars": unique_chars,
+        "special_tokens": special_tokens,
+        "x_values": result["x_values"],
+    }
+    print_lp_variable_counts(vocab_size, tokens["x_values"], cuopt_model)
+    # Drop x_values before pickling to keep output shape identical to the
+    # single-size path.
+    tokens.pop("x_values", None)
+    file_name = os.path.join(save_dir, f"lp_tokens_{vocab_size}.pkl")
+    with open(file_name, "wb") as f:
+        pickle.dump(tokens, f)
+    print(f"[sweep] Saved vocabulary output to {file_name}", flush=True)
+
+
+def train_lp_tokenizer_sweep(dataset, unique_chars, vocab_sizes, save_dir,
+                             pretokenizer_obj, special_tokens,
+                             pently_rho=0.0, celex_dir=None,
+                             vocab_utilisation_weight=0.0, training_mode="standard",
+                             max_token_bytes=None, super_base_vocab_size=None,
+                             compression_divisor=None):
+    options = TrainingOptions(training_mode, max_token_bytes, super_base_vocab_size)
+    options.validate_penalties(pently_rho, vocab_utilisation_weight)
+    if not vocab_sizes:
+        return
+
+    # Build the LP once with the largest vocab size so the lp_budget > 0 check
+    # in the Tokenizer holds for every entry in the sweep.
+    sorted_sizes = sorted(set(int(vs) for vs in vocab_sizes))
+    if training_mode != "standard":
+        reserved = len(BYTE_LEVEL_ALPHABET) + len(special_tokens)
+        for size in sorted_sizes:
+            if size <= reserved:
+                raise ValueError(f"Vocabulary size must exceed {reserved} reserved tokens")
+            if training_mode == "super":
+                options.base_size(size, reserved)
+        save_dir = str(mode_directory(save_dir, training_mode))
+
+    tokenizer = Tokenizer(
+        corpus=dataset,
+        vocab_size=sorted_sizes[-1],
+        special_tokens=special_tokens,
+        unique_chars=unique_chars,
+        pretokenizer=pretokenizer_obj,
+        training_mode=training_mode, max_token_bytes=max_token_bytes,
+        super_base_vocab_size=super_base_vocab_size,
+    )
+    print(
+        f"[pipeline] Tokenizer initialized: rows={len(dataset):,}, "
+        f"vocab_sizes={sorted_sizes}"
+    )
+    unmatched_report_path = (
+        os.path.join(save_dir, "celex_unmatched.tsv")
+        if pently_rho > 0.0
+        else None
+    )
+    tokenizer.prepare_cuopt_model(
+        pently_rho=pently_rho,
+        vocab_utilisation_weight=vocab_utilisation_weight,
+        compression_divisor=compression_divisor,
+        celex_dir=celex_dir,
+        unmatched_report_path=unmatched_report_path,
+    )
+
+    os.makedirs(save_dir, exist_ok=True)
+    # Each PDLP solve uses the configured GPUs together. Keeping budgets
+    # sequential avoids pinning a solve to one GPU or oversubscribing devices.
+    for vs in sorted_sizes:
+        _solve_and_save_lp_vocab(
+            tokenizer._cuopt_model,
+            tokenizer.unique_chars,
+            list(tokenizer.special_tokens_list),
+            vs,
+            save_dir,
+        )
+
+
+def infer_text_column(dataset):
+    preferred_columns = ("text", "content", "code")
+    for column in preferred_columns:
+        if column in dataset.column_names:
+            return column
+
+    for name, feature in dataset.features.items():
+        dtype = getattr(feature, "dtype", None)
+        if dtype in {"string", "large_string"}:
+            return name
+
+    raise ValueError(f"Could not infer text column from columns: {dataset.column_names}")
+
+
+def normalize_to_text_column(dataset, source_name=None, text_column=None):
+    preferred_text_column = text_column or (SOURCE_TEXT_COLUMN.get(source_name) if source_name else None)
+    if text_column and text_column not in dataset.column_names:
+        raise ValueError(f"Text column {text_column!r} not found in {dataset.column_names}")
+    if preferred_text_column in dataset.column_names:
+        text_column = preferred_text_column
+    else:
+        text_column = infer_text_column(dataset)
+        if preferred_text_column is not None and preferred_text_column != text_column:
+            print(
+                f"[WARN] Source '{source_name}' expected text column '{preferred_text_column}' "
+                f"but using inferred column '{text_column}'."
+            )
+
+    if text_column != "text":
+        dataset = dataset.rename_column(text_column, "text")
+    columns_to_remove = [column for column in dataset.column_names if column != "text"]
+    if columns_to_remove:
+        dataset = dataset.remove_columns(columns_to_remove)
+    text_dtype = getattr(dataset.features.get("text"), "dtype", None)
+    if text_dtype != "string":
+        dataset = dataset.cast_column("text", Value("string"))
+    return dataset
+
+
+def load_training_dataset(path, text_column=None):
+    try:
+        dataset_obj = load_from_disk(path)
+        if hasattr(dataset_obj, "keys"):
+            if "train" in dataset_obj:
+                dataset = dataset_obj["train"]
+            else:
+                raise ValueError(
+                    f"DatasetDict at {path} does not contain a 'train' split. "
+                    f"Available splits: {list(dataset_obj.keys())}"
+                )
+        else:
+            dataset = dataset_obj
+
+        print("Loaded dataset using load_from_disk")
+        return normalize_to_text_column(dataset, text_column=text_column)
+    except Exception as load_from_disk_error:
+        print(
+            "[INFO] load_from_disk failed "
+            f"({type(load_from_disk_error).__name__}: {load_from_disk_error}). "
+            "Trying parquet-based loading."
+        )
+        base_path = Path(path)
+        if not base_path.exists():
+            raise FileNotFoundError(f"Dataset path does not exist: {path}") from load_from_disk_error
+
+        source_dirs = sorted(entry for entry in base_path.iterdir() if entry.is_dir())
+        source_datasets = []
+
+        for source_dir in source_dirs:
+            parquet_files = sorted(str(parquet_path) for parquet_path in source_dir.rglob("*.parquet"))
+            if not parquet_files:
+                continue
+
+            try:
+                source_chunks = []
+                total_rows = 0
+                for index, parquet_file in enumerate(parquet_files, start=1):
+                    source_chunk = load_dataset("parquet", data_files=parquet_file, split="train")
+                    source_chunk = normalize_to_text_column(source_chunk, source_name=source_dir.name, text_column=text_column)
+                    source_chunks.append(source_chunk)
+                    total_rows += len(source_chunk)
+                    if index % 200 == 0 or index == len(parquet_files):
+                        print(
+                            f"Source '{source_dir.name}': loaded {index}/{len(parquet_files)} parquet files"
+                        )
+
+                if len(source_chunks) == 1:
+                    source_dataset = source_chunks[0]
+                else:
+                    source_dataset = concatenate_datasets(source_chunks)
+                source_datasets.append(source_dataset)
+                print(
+                    f"Loaded source '{source_dir.name}' via parquet "
+                    f"({len(parquet_files)} files, {total_rows} rows)"
+                )
+            except Exception as source_error:
+                print(
+                    f"[ERROR] Failed loading source '{source_dir.name}' "
+                    f"with {len(parquet_files)} parquet files."
+                )
+                print(f"[ERROR] Exception type: {type(source_error).__name__}")
+                print(f"[ERROR] Exception message: {source_error}")
+                print("[ERROR] Traceback:")
+                print(traceback.format_exc())
+                raise RuntimeError(
+                    f"Parquet source load failed for '{source_dir.name}'. "
+                    f"First file: {parquet_files[0]}"
+                ) from source_error
+
+        if source_datasets:
+            return concatenate_datasets(source_datasets)
+
+        parquet_files = sorted(str(parquet_path) for parquet_path in base_path.rglob("*.parquet"))
+        if not parquet_files:
+            raise RuntimeError(
+                f"Failed to load as Dataset/DatasetDict and found no parquet files under: {path}"
+            ) from load_from_disk_error
+
+        print(f"Falling back to recursive parquet load ({len(parquet_files)} files)")
+        try:
+            dataset = load_dataset("parquet", data_files=parquet_files, split="train")
+            return normalize_to_text_column(dataset, text_column=text_column)
+        except Exception as parquet_error:
+            print("[ERROR] Recursive parquet fallback load failed.")
+            print(f"[ERROR] Exception type: {type(parquet_error).__name__}")
+            print(f"[ERROR] Exception message: {parquet_error}")
+            print("[ERROR] Traceback:")
+            print(traceback.format_exc())
+            raise
+
+
+APERTUS_SPECIAL_TOKENS = ["[UNK]", "[EOS]", "[PAD]", "[CLS]", "[SEP]", "[MASK]"]
+NANOCHAT_SPECIAL_TOKENS = [
+    "<|bos|>",
+    "<|user_start|>",
+    "<|user_end|>",
+    "<|assistant_start|>",
+    "<|assistant_end|>",
+    "<|python_start|>",
+    "<|python_end|>",
+    "<|output_start|>",
+    "<|output_end|>",
+    "<|unk|>",
+]
+
+_SPECIAL_TOKENS_BY_MODE = {
+    "pythia": APERTUS_SPECIAL_TOKENS,
+    "split_bytelevel": APERTUS_SPECIAL_TOKENS,
+    "apertus": APERTUS_SPECIAL_TOKENS,
+    "nanochat": NANOCHAT_SPECIAL_TOKENS,
+}
+
+
+def get_special_tokens(mode):
+    if mode not in _SPECIAL_TOKENS_BY_MODE:
+        raise ValueError(
+            f"No special tokens defined for PRETOKENIZER_MODE='{mode}'. "
+            f"Expected one of: {list(_SPECIAL_TOKENS_BY_MODE.keys())}"
+        )
+    return _SPECIAL_TOKENS_BY_MODE[mode]
+
+
+if __name__ == "__main__":
+    TRAIN_DATASET_PATH = os.environ.get(
+        "TRAIN_DATASET_PATH",
+        "/capstor/store/cscs/swissai/a139/datasets/tokenizer_training/tokenizer_training_dataset",
+    )
+    vocab_size = [int(size) for size in os.environ.get("VOCAB_SIZES", "131072").split(",") if size.strip()]
+    save_dir = os.environ.get("RAW_VOCAB_PATH", "rounding_vocabs_apertus_2/")
+    # Shared CELEX/Unicode weight: frequency * (1 + rho * (CELEX + Unicode)).
+    # PENTLY_RHO=0 disables both penalties; positive values enable both.
+    try:
+        pently_rho = validate_pently_rho(
+            float(os.environ.get("PENTLY_RHO", "0"))
+        )
+    except ValueError as error:
+        raise ValueError(
+            "PENTLY_RHO must be a finite, non-negative number."
+        ) from error
+    # Normalised objective: L_existing / D_V + lambda / LP_budget * sum_c (t_c - U_c / N_c).
+    # Example: VOCAB_UTILISATION_WEIGHT=0.1 python -m lp_tokenizer.training
+    vocab_utilisation_weight = float(os.environ.get("VOCAB_UTILISATION_WEIGHT", "0"))
+    divisor_config = os.environ.get("COMPRESSION_DIVISORS_JSON")
+    divisor_value = os.environ.get("COMPRESSION_DIVISOR")
+    if divisor_config:
+        compression_divisor = {
+            int(k): float(v) for k, v in json.loads(Path(divisor_config).read_text()).items()
+        }
+        missing = set(vocab_size) - set(compression_divisor)
+        if missing:
+            raise ValueError(f"Compression divisor missing for vocab sizes: {sorted(missing)}")
+    elif divisor_value:
+        compression_divisor = float(divisor_value)
+    else:
+        compression_divisor = None
+    if vocab_utilisation_weight > 0 and compression_divisor is None:
+        raise ValueError("Set COMPRESSION_DIVISOR or COMPRESSION_DIVISORS_JSON when VOCAB_UTILISATION_WEIGHT > 0")
+    training_mode = os.environ.get("LP_TRAINING_MODE", "standard").strip().lower()
+    max_token_bytes = os.environ.get("LP_MAX_TOKEN_BYTES")
+    max_token_bytes = int(max_token_bytes) if max_token_bytes is not None else None
+    super_base_vocab_size = os.environ.get("LP_SUPER_BASE_VOCAB_SIZE")
+    super_base_vocab_size = int(super_base_vocab_size) if super_base_vocab_size is not None else None
+    training_options = TrainingOptions(training_mode, max_token_bytes, super_base_vocab_size)
+    training_options.validate_penalties(pently_rho, vocab_utilisation_weight)
+    configured_celex_dir = os.environ.get("CELEX_DIR")
+    if pently_rho > 0 and not configured_celex_dir:
+        raise ValueError("Set CELEX_DIR when PENTLY_RHO > 0")
+    celex_dir = configured_celex_dir
+    special_tokens = get_special_tokens(PRETOKENIZER_MODE)
+    print(f"Using PRETOKENIZER_MODE={PRETOKENIZER_MODE}")
+    print(f"Using LP_TRAINING_MODE={training_mode}, max_token_bytes={training_options.max_token_bytes}")
+    print(f"Special tokens ({len(special_tokens)}): {special_tokens}")
+    print(f"Vocabulary utilisation weight: {vocab_utilisation_weight:g}")
+    print(f"Penalty rho (CELEX + Unicode): {pently_rho:g}")
+    if pently_rho > 0.0:
+        print(f"CELEX directory: {celex_dir}")
+    print(f"Loading training dataset from {TRAIN_DATASET_PATH}")
+
+    dataset = load_training_dataset(TRAIN_DATASET_PATH)
+    print(f"Loaded {len(dataset)} rows")
+
+    unique_chars = list(BYTE_LEVEL_ALPHABET)
+    print(f"Using fixed ByteLevel alphabet ({len(unique_chars)} symbols)")
+
+    train_lp_tokenizer_sweep(
+        dataset,
+        unique_chars,
+        vocab_size,
+        save_dir,
+        pretokenizer,
+        special_tokens,
+        pently_rho=pently_rho,
+        vocab_utilisation_weight=vocab_utilisation_weight,
+        celex_dir=celex_dir,
+        training_mode=training_mode,
+        max_token_bytes=max_token_bytes,
+        super_base_vocab_size=super_base_vocab_size,
+        compression_divisor=compression_divisor,
+    )
