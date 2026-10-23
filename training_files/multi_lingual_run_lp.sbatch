@@ -2,14 +2,14 @@
 #SBATCH -A a0229
 #SBATCH -p normal
 #SBATCH -t 03:30:00
-#SBATCH --output=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation-lp/logs/multilingual_output_%j.out
-#SBATCH --error=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation-lp/logs/multilingual_output_%j.err
+#SBATCH --output=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/multilingual_output_%j.out
+#SBATCH --error=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/multilingual_output_%j.err
 
 
 set -euo pipefail
 
 # Rename the open Slurm logs at startup; SBATCH directives do not expand dates.
-LOG_DIR="/capstor/store/cscs/swissai/a0229/jtempus/tokenisation-lp/logs"
+LOG_DIR="/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations"
 LOG_DATE="$(date +%Y-%m-%d_%H-%M-%S)"
 for LOG_EXT in out err; do
     mv -- "${LOG_DIR}/multilingual_output_${SLURM_JOB_ID}.${LOG_EXT}" \
@@ -18,7 +18,7 @@ done
 
 # User-tunable settings
 NAME="${NAME:-Multilingual}"
-REPO_DIR="${REPO_DIR:-/capstor/store/cscs/swissai/a0229/jtempus/lp-tokeniser}"
+REPO_DIR="${REPO_DIR:-/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations}"
 IOPS_ROOT="${IOPS_ROOT:-/iopsstor/scratch/cscs/jtempus/tokenisation-lp}"
 TARGET_ROWS="${TARGET_ROWS:-8000}"
 PRETOKENIZER_MODE="${PRETOKENIZER_MODE:-nanochat}"
