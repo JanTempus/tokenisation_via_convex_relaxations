@@ -176,6 +176,14 @@ def allocate_equal_quotas(source_names, target_rows):
     }
 
 
+def build_fineweb_english_source(fineweb_dataset_id=FINEWEB_DATASET_ID):
+    return {
+        "source": FINEWEB_ENGLISH_SOURCE,
+        "dataset_id": fineweb_dataset_id,
+        "parquet_prefix": FINEWEB_ENGLISH_PREFIX,
+    }
+
+
 def build_fineweb_prefix_sources(
     fineweb2_dataset_id=FINEWEB2_DATASET_ID,
     fineweb_dataset_id=FINEWEB_DATASET_ID,
@@ -188,13 +196,7 @@ def build_fineweb_prefix_sources(
         }
         for config in FINEWEB2_LANGUAGE_CONFIGS
     ]
-    sources.append(
-        {
-            "source": FINEWEB_ENGLISH_SOURCE,
-            "dataset_id": fineweb_dataset_id,
-            "parquet_prefix": FINEWEB_ENGLISH_PREFIX,
-        }
-    )
+    sources.append(build_fineweb_english_source(fineweb_dataset_id))
     return sources
 
 
@@ -488,23 +490,25 @@ if __name__ == "__main__":
             target_rows=args.target_rows,
             seed=args.seed,
         )
-    elif source == "fineweb2":
+    elif source in {"fineweb", "fineweb2"}:
         if args.name is None:
-            parser.error("--name is required when --source fineweb2")
+            parser.error(f"--name is required when --source {source}")
 
-        fineweb2_dataset_id = os.environ.get(
-            "FINEWEB2_DATASET_ID", FINEWEB2_DATASET_ID
-        )
         fineweb_dataset_id = os.environ.get(
             "FINEWEB_DATASET_ID", FINEWEB_DATASET_ID
         )
-        sources = build_fineweb_prefix_sources(
-            fineweb2_dataset_id=fineweb2_dataset_id,
-            fineweb_dataset_id=fineweb_dataset_id,
-        )
-        output_dir = args.output_dataset_dir or (
-            f"{args.name}_fineweb2_10lang_n{args.target_rows}"
-        )
+        if source == "fineweb":
+            sources = [build_fineweb_english_source(fineweb_dataset_id)]
+            default_output_dir = f"{args.name}_fineweb_eng_n{args.target_rows}"
+        else:
+            sources = build_fineweb_prefix_sources(
+                fineweb2_dataset_id=os.environ.get(
+                    "FINEWEB2_DATASET_ID", FINEWEB2_DATASET_ID
+                ),
+                fineweb_dataset_id=fineweb_dataset_id,
+            )
+            default_output_dir = f"{args.name}_fineweb2_10lang_n{args.target_rows}"
+        output_dir = args.output_dataset_dir or default_output_dir
         dataset, source_counts, shard_manifest = materialize_fineweb_prefix_dataset(
             args.target_rows,
             sources=sources,
@@ -561,5 +565,5 @@ if __name__ == "__main__":
         )
     else:
         parser.error(
-            f"Unknown --source '{source}'. Expected: parquet, finewebedu, fineweb2"
+            f"Unknown --source '{source}'. Expected: parquet, finewebedu, fineweb, fineweb2"
         )

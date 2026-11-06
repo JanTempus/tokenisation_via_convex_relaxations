@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # Rename the open Slurm logs at startup; SBATCH directives do not expand dates.
-LOG_DIR="/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations"
+LOG_DIR="/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs"
 LOG_DATE="$(date +%Y-%m-%d_%H-%M-%S)"
 for LOG_EXT in out err; do
     mv -- "${LOG_DIR}/multilingual_output_${SLURM_JOB_ID}.${LOG_EXT}" \
