@@ -12,6 +12,8 @@ from datasets import Value, concatenate_datasets, load_dataset
 _CLIMBMIX_SHARD_LIST_CACHE = {}
 FINEWEB2_DATASET_ID = "HuggingFaceFW/fineweb-2"
 FINEWEB_DATASET_ID = "HuggingFaceFW/fineweb"
+# Karpathy's pre-shuffled FineWeb-Edu, as used by nanochat; shards sit at the repo root.
+KARPATHY_FINEWEB_DATASET_ID = "karpathy/fineweb-edu-100b-shuffle"
 FINEWEB2_LANGUAGE_CONFIGS = (
     "cmn_Hani",
     "fra_Latn",
@@ -208,7 +210,7 @@ def list_ordered_parquet_shards(source, list_repo_tree_fn=None):
 
     repo_entries = list_repo_tree_fn(
         source["dataset_id"],
-        path_in_repo=source["parquet_prefix"].rstrip("/"),
+        path_in_repo=source["parquet_prefix"].rstrip("/") or None,
         recursive=False,
         repo_type="dataset",
     )
@@ -340,6 +342,72 @@ def materialize_fineweb_prefix_dataset(
     return dataset, source_counts, shard_manifest
 
 
+def materialize_shard_prefix_dataset(
+    source,
+    num_shards,
+    list_repo_tree_fn=None,
+    hf_hub_download_fn=None,
+    load_dataset_fn=None,
+    concatenate_datasets_fn=None,
+):
+    """Download the first `num_shards` ordered parquet shards and keep every valid text."""
+    if num_shards <= 0:
+        raise ValueError(f"num_shards must be positive, got {num_shards}")
+    if hf_hub_download_fn is None:
+        from huggingface_hub import hf_hub_download
+
+        hf_hub_download_fn = hf_hub_download
+    if load_dataset_fn is None:
+        load_dataset_fn = load_dataset
+    if concatenate_datasets_fn is None:
+        concatenate_datasets_fn = concatenate_datasets
+
+    source_name = source["source"]
+    shards = list_ordered_parquet_shards(source, list_repo_tree_fn)
+    if num_shards > len(shards):
+        raise ValueError(
+            f"Requested {num_shards} shards but {source['dataset_id']} has {len(shards)}"
+        )
+
+    chunks = []
+    shard_manifest = []
+    for shard in shards[:num_shards]:
+        print(f"[{source_name}] downloading {shard}")
+        local_path = hf_hub_download_fn(
+            repo_id=source["dataset_id"],
+            filename=shard,
+            repo_type="dataset",
+        )
+        shard_dataset = load_dataset_fn("parquet", data_files=local_path, split="train")
+        shard_dataset = normalize_to_text_column(
+            shard_dataset,
+            source_name=source_name,
+            source_text_columns={source_name: "text"},
+        )
+        downloaded_rows = len(shard_dataset)
+        shard_dataset = shard_dataset.filter(
+            lambda text: isinstance(text, str) and bool(text.strip()),
+            input_columns="text",
+        )
+        chunks.append(shard_dataset)
+        shard_manifest.append(
+            {
+                "source": source_name,
+                "dataset_id": source["dataset_id"],
+                "repository_path": shard,
+                "cache_path": str(local_path),
+                "downloaded_rows": downloaded_rows,
+                "retained_rows": len(shard_dataset),
+            }
+        )
+        print(f"[{source_name}] retained {len(shard_dataset)} documents from {shard}")
+
+    dataset = concatenate_datasets_fn(chunks)
+    if len(dataset) == 0:
+        raise RuntimeError(f"No valid documents in the first {num_shards} shards")
+    return dataset, {source_name: len(dataset)}, shard_manifest
+
+
 def get_library_versions():
     versions = {}
     for package_name in ("datasets", "huggingface_hub", "tokenizers"):
@@ -463,6 +531,12 @@ if __name__ == "__main__":
         type=int,
         default=None,
     )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=int(os.environ.get("NUM_SHARDS", "7")),
+        help="Shards to download for --source karpathy_fineweb (all their rows are kept).",
+    )
     parser.add_argument("--seed", type=int, default=int(os.environ.get("SEED", "42")))
     parser.add_argument(
         "--output-dataset-dir",
@@ -525,6 +599,36 @@ if __name__ == "__main__":
                 "library_versions": get_library_versions(),
             },
         )
+    elif source == "karpathy_fineweb":
+        if args.name is None:
+            parser.error("--name is required when --source karpathy_fineweb")
+        karpathy_source = {
+            "source": "karpathy_fineweb_edu",
+            "dataset_id": os.environ.get(
+                "KARPATHY_FINEWEB_DATASET_ID", KARPATHY_FINEWEB_DATASET_ID
+            ),
+            "parquet_prefix": "",
+        }
+        output_dir = args.output_dataset_dir or (
+            f"{args.name}_karpathy_fineweb_shards{args.num_shards}"
+        )
+        dataset, source_counts, shard_manifest = materialize_shard_prefix_dataset(
+            karpathy_source,
+            args.num_shards,
+        )
+        save_sampling_outputs(
+            output_dir,
+            dataset,
+            source_counts,
+            shard_manifest,
+            len(dataset),
+            selection_strategy="ordered_parquet_shards",
+            manifest_metadata={
+                "sources": [karpathy_source],
+                "num_shards": args.num_shards,
+                "library_versions": get_library_versions(),
+            },
+        )
     elif source == "parquet":
         DATASET_BASE_DIR = os.environ.get(
             "TOKENIZER_DATASET_BASE",
@@ -565,5 +669,5 @@ if __name__ == "__main__":
         )
     else:
         parser.error(
-            f"Unknown --source '{source}'. Expected: parquet, finewebedu, fineweb, fineweb2"
+            f"Unknown --source '{source}'. Expected: parquet, finewebedu, fineweb, fineweb2, karpathy_fineweb"
         )
