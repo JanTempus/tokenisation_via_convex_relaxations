@@ -131,6 +131,7 @@ def test_cuopt_forces_pdlp_and_configures_gpus(monkeypatch, gpu_count):
     settings = mock.Mock()
     parameters = SimpleNamespace(
         CUOPT_CROSSOVER="crossover", CUOPT_METHOD="method", CUOPT_NUM_GPUS="num_gpus",
+        CUOPT_ABSOLUTE_GAP_TOLERANCE="abs_gap", CUOPT_RELATIVE_GAP_TOLERANCE="rel_gap",
     )
     solver_settings = SimpleNamespace(
         SolverSettings=lambda: settings, SolverMethod=SimpleNamespace(PDLP=object()),
@@ -150,10 +151,46 @@ def test_cuopt_forces_pdlp_and_configures_gpus(monkeypatch, gpu_count):
         mock.call("crossover", False),
         mock.call("method", solver_settings.SolverMethod.PDLP),
         mock.call("num_gpus", int(gpu_count or "4")),
+        mock.call("abs_gap", 1e-5),
+        mock.call("rel_gap", 1e-5),
     ])
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
     with pytest.raises(ValueError, match="exposes fewer GPUs"):
         solve_cuopt_problem(model, 2, vocab_size=268, verbose=False)
+
+
+def test_new_budget_updates_constraint_without_rebuild(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from lp_tokenizer import lp_functions
+
+    monkeypatch.delenv("LP_NUM_GPUS", raising=False)
+    monkeypatch.delenv("LP_GAP_TOLERANCE", raising=False)
+    monkeypatch.delenv("CUDA_VISIBLE_DEVICES", raising=False)
+    parameters = SimpleNamespace(
+        CUOPT_CROSSOVER="c", CUOPT_METHOD="m", CUOPT_NUM_GPUS="g",
+        CUOPT_ABSOLUTE_GAP_TOLERANCE="a", CUOPT_RELATIVE_GAP_TOLERANCE="r",
+    )
+    solver_settings = SimpleNamespace(
+        SolverSettings=mock.Mock, SolverMethod=SimpleNamespace(PDLP=object()),
+    )
+    monkeypatch.setitem(sys.modules, "cuopt.linear_programming.solver.solver_parameters", parameters)
+    monkeypatch.setitem(sys.modules, "cuopt.linear_programming.solver_settings", solver_settings)
+    budget = SimpleNamespace(RHS=2.0)
+    problem = mock.Mock(Status=SimpleNamespace(name="Optimal"), SolveTime=0.1)
+    problem.updateConstraint.side_effect = lambda constr, rhs: setattr(constr, "RHS", rhs)
+    model = {
+        "problem": problem, "budget_constraint": budget, "cuopt_lp_data": {},
+        "current_budget": 2, "current_vocab_size": 268,
+        "num_f": 0, "num_g": 0, "num_t": 1,
+        "variables": [SimpleNamespace(Value=3.0)],
+    }
+    with mock.patch.object(lp_functions, "build_cuopt_problem") as build:
+        lp_functions.solve_cuopt_problem(model, 3, vocab_size=269, verbose=False)
+    build.assert_not_called()
+    problem.updateConstraint.assert_called_once_with(budget, rhs=3.0)
+    assert budget.RHS == 3.0
+    assert model["current_budget"] == 3 and model["current_vocab_size"] == 269
 
 
 def test_sweep_keeps_all_gpus_visible_for_each_budget(tmp_path, monkeypatch):

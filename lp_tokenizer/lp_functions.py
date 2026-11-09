@@ -1311,17 +1311,60 @@ def build_cuopt_problem(cuopt_lp_data, numAllowedTokens: int, verbose: bool = Tr
     }
 
 
+DEFAULT_GAP_TOLERANCE = 1e-5
+
+
+def _update_cuopt_budget(model, requested_budget, vocab_size, verbose=True):
+    """Retarget an existing cuOpt Problem to a new budget without rebuilding it."""
+    if (model.get("current_budget") == requested_budget
+            and model.get("current_vocab_size") == vocab_size):
+        if verbose:
+            print(
+                "[solve_cuopt_problem] Reusing cuOpt Problem already built with "
+                f"numAllowedTokens={requested_budget}"
+            )
+        return
+    problem = model["problem"]
+    budget_constraint = model["budget_constraint"]
+    if budget_constraint is None:
+        raise RuntimeError("cuOpt model has no budget constraint to update")
+    # updateConstraint marks the RHS stale, so the next solve patches only
+    # that value in the cached data model.
+    problem.updateConstraint(budget_constraint, rhs=float(requested_budget))
+    if float(budget_constraint.RHS) != float(requested_budget):
+        raise RuntimeError(
+            f"cuOpt budget update failed: RHS={budget_constraint.RHS}, "
+            f"expected {requested_budget}"
+        )
+    cuopt_lp_data = model["cuopt_lp_data"]
+    if cuopt_lp_data.get("vocab_utilisation_weight", 0.0) > 0.0:
+        # The normalised objective depends on the budget and vocab size.
+        _, MINIMIZE, LinearExpression = _import_cuopt_problem()
+        c = _cuopt_objective(cuopt_lp_data, requested_budget, vocab_size)
+        problem.setObjective(LinearExpression(model["variables"], c, 0.0), MINIMIZE)
+    print(
+        "[solve_cuopt_problem] Updated budget constraint in place: "
+        f"{model.get('current_budget')} -> {requested_budget}"
+    )
+    model["current_budget"] = requested_budget
+    model["current_vocab_size"] = vocab_size
+
+
 def solve_cuopt_problem(model, numAllowedTokens: int,
                         solver_parameters=None, verbose: bool = True,
                         vocab_size: int = None):
     from cuopt.linear_programming.solver.solver_parameters import (
-        CUOPT_CROSSOVER, CUOPT_METHOD, CUOPT_NUM_GPUS,
+        CUOPT_ABSOLUTE_GAP_TOLERANCE, CUOPT_CROSSOVER, CUOPT_METHOD,
+        CUOPT_NUM_GPUS, CUOPT_RELATIVE_GAP_TOLERANCE,
     )
     from cuopt.linear_programming.solver_settings import SolverMethod, SolverSettings
 
     num_gpus = int(os.environ.get("LP_NUM_GPUS", "4"))
     if num_gpus <= 0:
         raise ValueError(f"LP_NUM_GPUS must be positive, got {num_gpus}")
+    gap_tolerance = float(os.environ.get("LP_GAP_TOLERANCE", DEFAULT_GAP_TOLERANCE))
+    if not np.isfinite(gap_tolerance) or gap_tolerance <= 0:
+        raise ValueError(f"LP_GAP_TOLERANCE must be finite and positive, got {gap_tolerance}")
     visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
     if visible_devices is not None:
         devices = [device.strip() for device in visible_devices.split(",") if device.strip()]
@@ -1338,16 +1381,10 @@ def solve_cuopt_problem(model, numAllowedTokens: int,
             f"compression_divisor={model['cuopt_lp_data']['compression_divisor']} "
             f"utilisation_divisor={requested_budget}"
         )
-    wrapper_is_current = (
-        model.get("problem") is not None
-        and model.get("current_budget") == requested_budget
-        and model.get("current_vocab_size") == vocab_size
-    )
-    if not wrapper_is_current:
-        # Build directly with the requested budget. In-place mutation of an
-        # existing budget constraint was observed to silently fail, so a
-        # different budget still requires a fresh wrapper. The expensive sparse
-        # matrices are retained and reused across the vocabulary sweep.
+    if model.get("problem") is None:
+        # The wrapper is built once, on the first solve of a sweep. Later
+        # budgets only change the budget row's RHS (and, with utilisation
+        # weighting, the objective), so the wrapper is updated in place.
         print(
             "[solve_cuopt_problem] Building cuOpt Problem with "
             f"numAllowedTokens={requested_budget}"
@@ -1361,11 +1398,8 @@ def solve_cuopt_problem(model, numAllowedTokens: int,
         model["budget_constraint"] = rebuilt["budget_constraint"]
         model["current_budget"] = requested_budget
         model["current_vocab_size"] = vocab_size
-    elif verbose:
-        print(
-            "[solve_cuopt_problem] Reusing cuOpt Problem already built with "
-            f"numAllowedTokens={requested_budget}"
-        )
+    else:
+        _update_cuopt_budget(model, requested_budget, vocab_size, verbose)
 
     num_f = model["num_f"]
     num_g = model["num_g"]
@@ -1377,8 +1411,10 @@ def solve_cuopt_problem(model, numAllowedTokens: int,
     settings.set_parameter(CUOPT_CROSSOVER, False)
     settings.set_parameter(CUOPT_METHOD, SolverMethod.PDLP)
     settings.set_parameter(CUOPT_NUM_GPUS, num_gpus)
+    settings.set_parameter(CUOPT_ABSOLUTE_GAP_TOLERANCE, gap_tolerance)
+    settings.set_parameter(CUOPT_RELATIVE_GAP_TOLERANCE, gap_tolerance)
     if verbose:
-        print(f"[cuopt-solve] method=PDLP num_gpus={num_gpus}")
+        print(f"[cuopt-solve] method=PDLP num_gpus={num_gpus} gap_tolerance={gap_tolerance:g}")
 
     start = time.time()
     problem.solve(settings)
@@ -1398,6 +1434,11 @@ def solve_cuopt_problem(model, numAllowedTokens: int,
     total_t = len(t_values)
     t_sum = float(t_values.sum())
     print(f"[INFO] numAllowedTokens={numAllowedTokens}  sum(t_values)={t_sum:.3f}")
+    if abs(t_sum - requested_budget) > 0.01 * requested_budget:
+        print(
+            f"[WARN] sum(t_values)={t_sum:.3f} differs from the budget "
+            f"{requested_budget} by more than 1%; check that the budget update applied"
+        )
     print(f"[INFO] t_values stats: {count_above_0999} above 0.999, {count_positive} strictly positive, out of {total_t} total")
 
     return {
@@ -1825,8 +1866,8 @@ def prepare_cuopt_model(inputStringList: list[str] = None,
 
     # Defer construction of the Python cuOpt Problem wrapper until the first
     # solve, when the real vocabulary budget is known. Constructing a budget-0
-    # wrapper here was wasted work because changing the constraint in place is
-    # unreliable and solve_cuopt_problem must rebuild it for a new budget.
+    # wrapper here was wasted work; later budgets in a sweep then update only
+    # the budget constraint's RHS on the wrapper built by the first solve.
     model = {
         "problem": None,
         "variables": None,

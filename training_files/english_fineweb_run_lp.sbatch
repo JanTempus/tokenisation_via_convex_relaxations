@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A a0229
 #SBATCH -p normal
-#SBATCH -t 2:30:00
+#SBATCH -t 3:00:00
 #SBATCH --output=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/english_fineweb_output_%j.out
 #SBATCH --error=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/english_fineweb_output_%j.err
 
@@ -33,7 +33,7 @@ VOCAB_SIZES="${VOCAB_SIZES:-32768,65536}"
 NUM_PROC="${NUM_PROC:-64}"
 BATCH_SIZE="${BATCH_SIZE:-10000}"
 # Number of GPUs visible to the solve process to use together for PDLP.
-LP_NUM_GPUS="${LP_NUM_GPUS:-4}"
+LP_NUM_GPUS="${LP_NUM_GPUS:-1}"
 if [[ ! "${LP_NUM_GPUS}" =~ ^[1-9][0-9]*$ ]]; then
     echo "ERROR: LP_NUM_GPUS must be a positive integer" >&2
     exit 1

@@ -31,6 +31,8 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=10000)
     p.add_argument("--num-gpus", type=int, default=4,
                    help="GPUs used together by each PDLP solve (default: 4)")
+    p.add_argument("--gap-tolerance", type=float, default=1e-5,
+                   help="PDLP absolute and relative duality gap tolerance (default: 1e-5)")
     return p
 
 
@@ -44,6 +46,8 @@ def validate(args: argparse.Namespace) -> None:
     for name in ("num_proc", "batch_size", "num_gpus"):
         if getattr(args, name) <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive")
+    if not math.isfinite(args.gap_tolerance) or args.gap_tolerance <= 0:
+        raise ValueError("--gap-tolerance must be finite and positive")
     if not math.isfinite(args.pently_rho) or args.pently_rho < 0:
         raise ValueError("--pently-rho must be finite and nonnegative")
     if not math.isfinite(args.vocab_utilisation_weight) or args.vocab_utilisation_weight < 0:
@@ -110,6 +114,7 @@ def run(argv: list[str] | None = None) -> int:
     os.environ["NUM_PROC"] = str(args.num_proc)
     os.environ["BATCH_SIZE"] = str(args.batch_size)
     os.environ["LP_NUM_GPUS"] = str(args.num_gpus)
+    os.environ["LP_GAP_TOLERANCE"] = repr(args.gap_tolerance)
     os.environ["PRETOKENIZER_MODE"] = args.pretokenizer
 
     from lp_tokenizer.export import export_raw_vocabulary
