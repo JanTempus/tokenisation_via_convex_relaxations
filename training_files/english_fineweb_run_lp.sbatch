@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -A a0229
 #SBATCH -p normal
-#SBATCH -t 3:00:00
+#SBATCH -t 3:30:00
 #SBATCH --output=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/english_fineweb_output_%j.out
 #SBATCH --error=/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_via_convex_relaxations/logs/english_fineweb_output_%j.err
 
@@ -29,7 +29,7 @@ IOPS_ROOT="${IOPS_ROOT:-/iopsstor/scratch/cscs/jtempus/tokenisation-lp}"
 # Every non-empty document in these shards is used for training.
 NUM_SHARDS="${NUM_SHARDS:-7}"
 PRETOKENIZER_MODE="${PRETOKENIZER_MODE:-nanochat}"
-VOCAB_SIZES="${VOCAB_SIZES:-32768,65536}"
+VOCAB_SIZES="${VOCAB_SIZES:-32768,65536,131072}"
 NUM_PROC="${NUM_PROC:-64}"
 BATCH_SIZE="${BATCH_SIZE:-10000}"
 # Number of GPUs visible to the solve process to use together for PDLP.
@@ -48,13 +48,15 @@ if (( VISIBLE_GPUS < LP_NUM_GPUS )); then
     exit 1
 fi
 
+PENTLY_RHO="${PENTLY_RHO:-0.5}"
 DATASET_TAG="${NAME}_shards${NUM_SHARDS}"
 RUN_DIR="${IOPS_ROOT}/runs/${DATASET_TAG}_${SLURM_JOB_ID}"
 OUTPUT_DATASET_DIR="${OUTPUT_DATASET_DIR:-${IOPS_ROOT}/datasets/${DATASET_TAG}}"
 TRAIN_DATASET_PATH="${TRAIN_DATASET_PATH:-${OUTPUT_DATASET_DIR}}"
 RAW_VOCAB_PATH="${RAW_VOCAB_PATH:-${IOPS_ROOT}/raw_vocabs/${DATASET_TAG}_compression}"
 LP_GRAPH_CACHE_DIR="${LP_GRAPH_CACHE_DIR:-${RUN_DIR}/lp_graph}"
-SAVE_TOKENIZER_DIR="${SAVE_TOKENIZER_DIR:-${REPO_DIR}/rounded_tokenizers/${DATASET_TAG}_compression}"
+SAVE_TOKENIZER_DIR="${SAVE_TOKENIZER_DIR:-${REPO_DIR}/rounded_tokenizers/${DATASET_TAG}_morph}"
+
 
 TMPDIR="/iopsstor/scratch/cscs/jtempus/tmp/${SLURM_JOB_ID}"
 TMP="${TMPDIR}"
@@ -88,6 +90,7 @@ cd "${RUN_DIR}"
 # Training runs from RUN_DIR, so pin imports to this checkout.
 export PYTHONPATH="${REPO_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 
+export CELEX_DIR="${CELEX_DIR:-/capstor/store/cscs/swissai/a0229/jtempus/tokenisation_lp/CELEX_V2}"
 export NAME
 export REPO_DIR
 export IOPS_ROOT
@@ -117,7 +120,7 @@ export MPLCONFIGDIR
 export RUN_TOKENIZER_TESTS
 export BYTE_TEST_BEHAVIOR
 export VOCAB_UTILISATION_WEIGHT=0
-export PENTLY_RHO=0
+export PENTLY_RHO
 
 echo "Run tag:              ${DATASET_TAG}"
 echo "Repository:           ${REPO_DIR}"
